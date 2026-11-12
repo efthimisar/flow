@@ -2583,19 +2583,28 @@ private:
         Array<File> files;
         for (const auto& ext : { "*.png", "*.jpg", "*.jpeg" }) dir.findChildFiles (files, File::findFiles, false, ext);
         if (files.isEmpty()) return {};
-        // Χωρίς επανάληψη: διαλέγει μόνο από όσες δεν έχουν χρησιμοποιηθεί ακόμα· όταν τελειώσουν, ξαναρχίζει (χωρίς να βάλει πρώτη την τελευταία)
-        auto unused = [&] { Array<File> u; for (const auto& f : files) if (! used.contains (f.getFileName())) u.add (f); return u; };
-        auto pool = unused();
-        if (pool.isEmpty())
+        // Μοτίβο: σειρά ονόματος (φυσική ταξινόμηση, 1, 2, … 10), μία-μία χωρίς επανάληψη· όταν περάσουν όλες, ξαναρχίζει από την πρώτη
+        struct ByName { static int compareElements (const File& x, const File& y) { return x.getFileName().compareNatural (y.getFileName()); } };
+        ByName byName;
+        files.sort (byName);
+        Image src;
+        File chosen;
+        for (int attempt = 0; attempt < 2 && ! src.isValid(); ++attempt)
         {
-            const String last = used.isEmpty() ? String() : used[used.size() - 1];
-            used.clear();
-            for (const auto& f : files) if (files.size() < 2 || f.getFileName() != last) pool.add (f);
+            for (const auto& f : files)
+                if (! used.contains (f.getFileName()))
+                {
+                    chosen = f;
+                    used.add (f.getFileName());
+                    src = ImageFileFormat::loadFrom (f);
+                    if (src.isValid() && src.getWidth() >= 2 && src.getHeight() >= 2) break;   // αν δεν διαβάζεται, πάει στην επόμενη
+                    src = {};
+                    chosen = File();
+                }
+            if (! src.isValid()) used.clear();   // τελείωσαν όλες: νέος κύκλος από την πρώτη
         }
-        const File chosen = pool[rnd.nextInt (pool.size())];
-        used.add (chosen.getFileName());
-        const Image src = ImageFileFormat::loadFrom (chosen);
-        if (! src.isValid() || src.getWidth() < 2 || src.getHeight() < 2) return {};
+        if (! src.isValid()) return {};
+        flow::flowLog ("orb image: " + chosen.getFileName() + " (" + String (jmin (files.size(), used.size())) + "/" + String (files.size()) + ")");
 
         Image sq (Image::RGB, N, N, true);   // κεντραρισμένο τετράγωνο, διάφανες περιοχές πάνω σε λευκό
         {
@@ -2652,7 +2661,7 @@ private:
         auto* st = properties.getUserSettings();
         StringArray used = StringArray::fromLines (st->getValue ("orbUsed"));
         Image im = orbFromFolder (rnd, used);
-        st->setValue ("orbUsed", used.joinIntoString ("\n"));                    // 1) δική σου εικόνα από Music/Flow/Orb, βαμμένη με Wada
+        st->setValue ("orbUsed", used.joinIntoString ("\n")); st->saveIfNeeded();   // 1) δική σου εικόνα από Music/Flow/Orb, βαμμένη με Wada
         if (! im.isValid()) im = orbGenerated (rnd);       // 2) αλλιώς η γεννήτρια
         setOrbImage (im, false);
     }
@@ -5420,7 +5429,7 @@ class FlowApplication : public JUCEApplication
 {
 public:
     const String getApplicationName() override    { return "Flow"; }
-    const String getApplicationVersion() override { return "0.90.19"; }
+    const String getApplicationVersion() override { return "0.90.20"; }
     bool moreThanOneInstanceAllowed() override    { return false; }
 
     void initialise (const String&) override
