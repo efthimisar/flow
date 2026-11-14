@@ -438,11 +438,12 @@ private:
     }
 
     //==========================================================================
-    // σκηνές 1 και 2: ρυθμίσεις και λούπες κάθε block. Plugins και ζώνες δεν αλλάζουν. Η σκηνή που ισχύει ζει στην engine·
+    // σκηνές 1, 2 και 3 (κύκλος): ρυθμίσεις και λούπες κάθε block. Plugins και ζώνες δεν αλλάζουν. Η σκηνή που ισχύει ζει στην engine·
     // η άλλη φυλάσσεται εδώ. Η αλλαγή γίνεται στο επόμενο μέτρο από το thread ήχου (flow::Engine::sceneProcess).
-    std::array<flow::SceneData, 2> scenes;
+    static constexpr int kScenes = 3;
+    std::array<flow::SceneData, (size_t) kScenes> scenes;
     flow::SceneData sceneBuf;       // το αντίγραφο που παραδίδεται στην engine· μετά την αλλαγή περιέχει την προηγούμενη κατάσταση
-    int currentScene = 0;           // 0 = σκηνή 1, 1 = σκηνή 2
+    int currentScene = 0;           // 0 = σκηνή 1, 1 = σκηνή 2, 2 = σκηνή 3
     int sceneTarget = -1;           // σκηνή που περιμένει το επόμενο μέτρο (-1 = καμία)
     int sceneSeenDone = 0;
     uint32 sceneReqMs = 0;
@@ -473,7 +474,7 @@ private:
 
     void requestScene (int i)
     {
-        if (i < 0 || i > 1 || i == currentScene || sceneTarget >= 0) return;
+        if (i < 0 || i >= kScenes || i == currentScene || sceneTarget >= 0) return;
         if (! scenes[(size_t) i].saved) sceneSettingsFromLive (scenes[(size_t) i]);
         sceneBuf = scenes[(size_t) i];
         sceneBuf.prepare();
@@ -494,7 +495,7 @@ private:
             const int first = engine.stripFirst.load();
             flow::flowLog ("strip: touch at " + String (first));
             s88ScenesOpen = true; s88RingsOpen = false;
-            requestScene (first >= 64 ? 1 : 0);
+            requestScene (first >= 86 ? 2 : first >= 43 ? 1 : 0);   // το strip σε τρία τμήματα
         }
         if (sceneTarget < 0) return;
         bool done = engine.sceneDone.load() != sceneSeenDone;
@@ -1163,7 +1164,7 @@ private:
             case 39: if (! s88RingsOpen) { s88RingsOpen = true; s88Ring = 0; s88Slot = 0; } else motionTile.triggerClick(); break;   // 1ο πάτημα: οθόνη Orb Rings· 2ο: Rec motion (η οθόνη μένει)
             case 41:   // Scene: 1ο πάτημα ανοίγει τις οθόνες σκηνών (δείχνουν την τωρινή)· κάθε επόμενο πάτημα ζητά την άλλη σκηνή στο επόμενο μέτρο
                 if (! s88ScenesOpen) { s88ScenesOpen = true; s88RingsOpen = false; }
-                else requestScene (1 - (sceneTarget >= 0 ? sceneTarget : currentScene));
+                else if (sceneTarget < 0) requestScene ((currentScene + 1) % kScenes);   // κύκλος 1→2→3→1
                 break;
             default: break;
         }
@@ -1589,7 +1590,7 @@ private:
             for (int b = 0; b < flow::numBlocks; ++b)
                 s88LoopHas[(size_t) b] = isActive (b) && engine.getLoop (b, s88LoopCache[(size_t) b]);
         }
-        String s = "SC" + String (currentScene) + "," + String (sceneTarget) + "," + String ((int) ((now / 400) & 1)) + "," + String (selected) + "," + String (s88LoopVer) + ",";
+        String s = "SC" + String (currentScene) + "," + String (sceneTarget) + "," + String ((int) ((now / 400) & 1)) + "," + String ((int) (engine.scenePhaseOut.load() * 48.0)) + "," + String (selected) + "," + String (s88LoopVer) + ",";
         for (int b = 0; b < flow::numBlocks; ++b)
             if (s88LoopHas[(size_t) b]) s += String ((int) (s88LoopPhase (b) * 40.0)) + ".";
         return s;
@@ -1667,14 +1668,22 @@ private:
 
         // ---- δεξιά: κουτιά σκηνών και η λούπα του επιλεγμένου block
         const bool blink = ((Time::getMillisecondCounter() / 400) & 1) != 0;
-        for (int sc = 0; sc < 2; ++sc)
+        for (int sc = 0; sc < kScenes; ++sc)
         {
-            const float cy = sc == 0 ? 106.0f : 200.0f;
-            const Rectangle<float> bx (14.0f, cy - 30.0f, 60.0f, 60.0f);
-            const bool on = sc == currentScene;
-            if (on) { gRt.setColour (white); gRt.fillEllipse (bx); }
-            else { gRt.setColour (sc == sceneTarget && blink ? Colour (0xffc8c4be) : Colour (0xff5a5450)); gRt.drawEllipse (bx.reduced (1.0f), 2.0f); }   // επόμενη σκηνή: ο κύκλος αναβοσβήνει
-            gRt.setColour (on ? Colour (0xff1c1a19) : Colour (0xff827e78)); gRt.setFont (hobby::makeFont (typeface, 34.0f).boldened());
+            const float cy = 80.0f + 70.0f * (float) sc;
+            const Rectangle<float> bx (14.0f, cy - 28.0f, 56.0f, 56.0f);
+            const bool on = sc == currentScene, pend = sc == sceneTarget;
+            const bool lastBar = engine.sceneLeftBeatsOut.load() <= (double) flow::beatsPerBar + 0.01;
+            const bool lit = pend && lastBar && blink;   // η σκηνή που περιμένει αναβοσβήνει μόνο στο τελευταίο μέτρο πριν την αλλαγή
+            if (on || lit) { gRt.setColour (white); gRt.fillEllipse (bx); }
+            else { gRt.setColour (Colour (0xff5a5450)); gRt.drawEllipse (bx.reduced (1.0f), 2.0f); }
+            if (pend || (on && sceneTarget < 0))   // δαχτυλίδι: πόση από τη φράση έχει περάσει (γεμίζει ως την αλλαγή)
+            {
+                Path arc; const float fr = (float) engine.scenePhaseOut.load();
+                arc.addCentredArc (bx.getCentreX(), bx.getCentreY(), bx.getWidth() * 0.5f - 1.0f, bx.getHeight() * 0.5f - 1.0f, 0.0f, 0.0f, MathConstants<float>::twoPi * fr, true);
+                gRt.setColour (on ? Colour (0xff1c1a19) : white); gRt.strokePath (arc, PathStrokeType (4.0f));
+            }
+            gRt.setColour (on || lit ? Colour (0xff1c1a19) : pend ? white : Colour (0xff827e78)); gRt.setFont (hobby::makeFont (typeface, 30.0f).boldened());
             gRt.drawText (String (sc + 1), bx, Justification::centred, false);
         }
         if (! isActive (selected)) return;
@@ -4437,8 +4446,8 @@ private:
 
             auto* sx = root->createNewChildElement ("Scenes");
             sx->setAttribute ("current", currentScene);
-            const int other = 1 - currentScene;
-            if (scenes[(size_t) other].saved)
+            for (int other = 0; other < kScenes; ++other)
+            if (other != currentScene && scenes[(size_t) other].saved)
             {
                 auto* si = sx->createNewChildElement ("Scene");
                 si->setAttribute ("idx", other);
@@ -4598,11 +4607,11 @@ private:
         currentScene = 0; sceneTarget = -1;
         if (auto* sx = root.getChildByName ("Scenes"))
         {
-            currentScene = jlimit (0, 1, sx->getIntAttribute ("current", 0));
+            currentScene = jlimit (0, kScenes - 1, sx->getIntAttribute ("current", 0));
             for (auto* si : sx->getChildWithTagNameIterator ("Scene"))
             {
                 const int idx = si->getIntAttribute ("idx", -1);
-                if (idx < 0 || idx > 1 || idx == currentScene) continue;   // παλιό σύστημα A–D: οι σκηνές 3 και 4 αγνοούνται
+                if (idx < 0 || idx >= kScenes || idx == currentScene) continue;
                 auto& sc = scenes[(size_t) idx];
                 sc.prepare();
                 sc.saved = true;
@@ -5429,7 +5438,7 @@ class FlowApplication : public JUCEApplication
 {
 public:
     const String getApplicationName() override    { return "Flow"; }
-    const String getApplicationVersion() override { return "0.90.20"; }
+    const String getApplicationVersion() override { return "0.90.21"; }
     bool moreThanOneInstanceAllowed() override    { return false; }
 
     void initialise (const String&) override

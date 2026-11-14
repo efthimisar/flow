@@ -817,12 +817,23 @@ namespace flow
             ++changeCount;
         }
 
-        // στο τέλος κάθε block ήχου: αν πέρασε γραμμή μέτρου, γίνεται η αλλαγή σκηνής
+        // Αλλαγή σκηνής σε όριο φράσης: κάθε sceneGridBars μέτρα (0 = η μεγαλύτερη λούπα της σκηνής), μετρημένα από την αρχή (anchor) της μεγαλύτερης λούπας.
+        // Το UI διαβάζει πόσο έχει προχωρήσει η περίοδος (scenePhaseOut, 0..1) και πόσα beats μένουν (sceneLeftBeatsOut).
+        std::atomic<int> sceneGridBars { 4 };
+        std::atomic<double> scenePhaseOut { 0.0 }, sceneLeftBeatsOut { 0.0 };
+
+        // στο τέλος κάθε block ήχου: αν πέρασε το όριο της φράσης, γίνεται η αλλαγή σκηνής
         void sceneProcess (double beat0, double beat1)
         {
+            const int g = sceneGridBars.load();
+            const double P = std::max ((double) beatsPerBar, g > 0 ? (double) g * beatsPerBar : playCycle());
+            const double anc = playCycleAnchor();
+            const double k = std::ceil ((beat0 - anc) / P - 1.0e-9);
+            const double nb = anc + k * P;                       // το επόμενο όριο
+            scenePhaseOut = juce::jlimit (0.0, 1.0, 1.0 - (nb - beat0) / P);
+            sceneLeftBeatsOut = nb - beat0;
             auto* p = scenePend.load();
             if (p == nullptr) return;
-            const double nb = std::ceil (beat0 / beatsPerBar - 1.0e-9) * beatsPerBar;
             if (nb >= beat1) return;
             sceneSwapLocked (*p);
             scenePend = nullptr;
