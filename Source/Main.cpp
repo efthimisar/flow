@@ -1106,6 +1106,14 @@ private:
             return;
         }
         if (v == 0) return;   // μόνο πάτημα
+        if (ctl == 28 || ctl == 29)   // 28 = προηγούμενη σκηνή, 29 = επόμενη (κύκλος 1-2-3)· δείχνει και τις οθόνες Scene με την αντίστροφη μέτρηση
+        {
+            flow::flowLog ("S88 button " + String (ctl) + " pressed (scene " + String (currentScene + 1) + ", pending " + String (sceneTarget + 1) + ")");
+            if (s88RingsOpen) { s88RingsOpen = false; if (knobStage != 0) stopKnobLearn(); }
+            s88ScenesOpen = true;
+            if (sceneTarget < 0) requestScene ((currentScene + (ctl == 29 ? 1 : kScenes - 1)) % kScenes);
+            return;
+        }
         if (ctl == 10) { keyScreens.reclaim(); return; }   // κουμπί MIDI του S88: ξαναπαίρνει τις οθόνες αν τις έχει πάρει το Komplete Kontrol
         if (listOpen)
         {
@@ -5438,7 +5446,7 @@ class FlowApplication : public JUCEApplication
 {
 public:
     const String getApplicationName() override    { return "Flow"; }
-    const String getApplicationVersion() override { return "0.90.21"; }
+    const String getApplicationVersion() override { return "0.90.22"; }
     bool moreThanOneInstanceAllowed() override    { return false; }
 
     void initialise (const String&) override
