@@ -172,7 +172,7 @@ namespace flow
                 loopLayersOut[b] = 0;
                 loopMuteOut[b] = 0;
                 loopTapsOut[b] = 0;
-                cmdMain[b] = 0; cmdUndo[b] = 0; cmdStop[b] = 0; cmdMute[b] = 0; rerecReq[b] = 0; loopStoppedOut[b] = 0;
+                cmdMain[b] = 0; cmdUndo[b] = 0; cmdStop[b] = 0; cmdMute[b] = 0; rerecReq[b] = 0; loopStoppedOut[b] = 0; loopStopPendOut[b] = 0;
             }
             for (int i = 0; i < numControls; ++i) mapCode[i] = 0;
             owner.fill (-1);
@@ -186,7 +186,7 @@ namespace flow
         std::array<std::atomic<uint64_t>, numBlocks * 2> latchBits;   // πλήκτρα που κρατιούνται από το Latch (και νότες συγχορδίας), για την οθόνη
         std::array<std::atomic<int>, numBlocks> active, emptyZone, zoneState, zoneFirst, zoneSeq, lo, hi, holdMode, arpMode, curveMode, transpose, blockOff, chordMode, chordType, chordMinor, chordTonic, pcMaskOut, bassOut,
                                                 volMap, loopStateOut, loopLayersOut, loopMuteOut, loopTapsOut,
-                                                cmdMain, cmdUndo, cmdStop, cmdMute, rerecReq, loopStoppedOut;
+                                                cmdMain, cmdUndo, cmdStop, cmdMute, rerecReq, loopStoppedOut, loopStopPendOut;
         std::array<std::atomic<double>, numBlocks> loopBeatsOut, recStartBeatOut, loopAnchorOut;
         std::atomic<double> cycleAnchorOut { 0.0 };   // αρχή του κύκλου (της μεγαλύτερης λούπας) για την οθόνη
         std::array<std::atomic<float>, numBlocks> volPos, gainOut;
@@ -760,7 +760,7 @@ namespace flow
                 B.layerArm[(size_t) l] = (B.layerMode[(size_t) l] != 0) ? -2.0 : -1.0;   // once/hold ξεκινούν στο επόμενο μέτρο
             }
             B.muteMask = snap.mute;
-            B.loopAnchor = snap.anchor;
+            B.loopAnchor = snap.anchor; B.stopLoopAt = -1.0; B.playAt = -1.0;
             B.loopState = B.nLayers > 0 ? loopPlay : loopOff;
         }
 
@@ -800,7 +800,7 @@ namespace flow
                 auto& B = blocks[(size_t) b];
                 if (B.plugin == nullptr || x.layers.size() != (size_t) maxLayers) continue;
                 cutLoopNotes (B);
-                B.rec.clear(); B.recOpen.reset(); B.stopAt = -1.0; B.taps = 0; B.stopped = false;
+                B.rec.clear(); B.recOpen.reset(); B.stopAt = -1.0; B.stopLoopAt = -1.0; B.playAt = -1.0; B.taps = 0; B.stopped = false;
                 for (int l = 0; l < maxLayers; ++l) std::swap (B.layerEv[(size_t) l], x.layers[(size_t) l]);
                 std::swap (B.nLayers, x.nLayers);
                 std::swap (B.loopBeats, x.beats);
@@ -1242,6 +1242,7 @@ namespace flow
             int arpIndex = 0;
             int loopState = loopOff;
             double recStart = 0.0, loopBeats = 0.0;
+            double stopLoopAt = -1.0, playAt = -1.0;   // στοπ στο τέλος της λούπας / επανεκκίνηση από την αρχή της στο επόμενο μέτρο (-1 = καμία)
             double loopAnchor = 0.0;   // beat όπου ξεκινά η λούπα: η εγγραφή ξεκίνησε εκεί και το τέλος της οδηγεί πάλι εκεί
             bool panicPending = false;
             std::vector<LoopEvent> rec;
@@ -1262,7 +1263,7 @@ namespace flow
                 rec.clear();
                 for (auto& l : layerEv) l.clear();
                 layerMode.fill (0); layerStart.fill (-1.0); layerArm.fill (-1.0); curMode = 0;
-                nLayers = 0; muteMask = 0; taps = 0; lastTap = 0; stopped = false; userStopped = false; undoTaps = 0; stopTaps = 0; stopTapValid = false; loopSusMask = 0; loopBendMask = 0;
+                nLayers = 0; muteMask = 0; taps = 0; lastTap = 0; stopped = false; userStopped = false; undoTaps = 0; stopTaps = 0; stopLoopAt = -1.0; playAt = -1.0; stopTapValid = false; loopSusMask = 0; loopBendMask = 0;
                 out.clear();
             }
         };
@@ -3407,12 +3408,28 @@ private:
                         B.muteMask ^= 2u;   // το δεύτερο στρώμα τρέχει σιωπηλά και γυρίζει συγχρονισμένο
                         cutLoopNotes (B);
                     }
-                    else B.userStopped = ! B.userStopped;
+                    else if (! B.userStopped && B.loopState == loopPlay && B.loopBeats > 0.0 && ! B.stopped)
+                    {   // στοπ: περιμένει το τέλος της λούπας (της μεγαλύτερης)· δεύτερο πάτημα πριν το τέλος το ακυρώνει
+                        if (B.stopLoopAt >= 0.0) B.stopLoopAt = -1.0;
+                        else B.stopLoopAt = B.loopAnchor + std::ceil ((beat0 - B.loopAnchor) / B.loopBeats - 1.0e-9) * B.loopBeats;
+                    }
+                    else
+                    {
+                        B.userStopped = ! B.userStopped;
+                        B.stopLoopAt = -1.0;
+                        if (! B.userStopped && B.loopBeats > 0.0 && B.loopState == loopPlay)
+                        {   // play: η λούπα ξαναρχίζει από την αρχή της στο επόμενο μέτρο
+                            B.playAt = std::ceil (beat0 / beatsPerBar - 1.0e-9) * beatsPerBar;
+                            B.loopAnchor = B.playAt;
+                        }
+                    }
                     B.stopTaps = 0;
                 }
             }
             {   // σταματούν με κομμένες νότες και ξαναμπαίνουν στη φάση τους (κουμπί του block ή Play/Stop όλων)
-                const bool st = B.userStopped || loopsStopped.load() != 0;
+                if (B.stopLoopAt >= 0.0 && beat0 >= B.stopLoopAt - 1.0e-9) { B.userStopped = true; B.stopLoopAt = -1.0; }
+                if (B.playAt >= 0.0 && beat0 >= B.playAt - 1.0e-9) B.playAt = -1.0;
+                const bool st = B.userStopped || loopsStopped.load() != 0 || (B.playAt >= 0.0 && beat1 <= B.playAt + 1.0e-9);
                 if (st != B.stopped)
                 {
                     B.stopped = st;
@@ -3507,7 +3524,7 @@ private:
                             for (double m = std::floor ((beat0 - B.loopAnchor) / L); m <= std::floor ((beat1 - 1.0e-9 - B.loopAnchor) / L); m += 1.0)
                             {
                                 const double x = B.loopAnchor + m * L + e.phase;
-                                if (x >= beat0 && x < beat1) push (x, e);
+                                if (x >= beat0 && x < beat1 && (B.stopLoopAt < 0.0 || x < B.stopLoopAt - 1.0e-9) && (B.playAt < 0.0 || x >= B.playAt - 1.0e-9)) push (x, e);
                             }
                     }
                     else if (B.layerStart[ul] >= 0.0)   // once / hold at end: παίζει μία φορά από την αρχή του και μετά περιμένει
@@ -3700,6 +3717,7 @@ private:
             loopMuteOut[b]   = (int) B.muteMask;
             loopTapsOut[b]   = B.taps;
             loopStoppedOut[b] = B.stopped ? 1 : 0;
+            loopStopPendOut[b] = B.stopLoopAt >= 0.0 ? 1 : 0;
             recStartBeatOut[b] = B.recStart;
 
         }

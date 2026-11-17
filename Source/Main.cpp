@@ -76,7 +76,7 @@ public:
         folderTile.setTooltip (gr ("Settings: sets, audio and MIDI, master volume, Rec Audio folder, Link, Panic"));
         recTile.setTooltip ("Rec MIDI loop: " + gr ("records the loop of the selected block (the number inside the circle). Press again = end. If the block already has a loop, it starts an overdub (up to 2 layers); press again to end it. Right-click: quantize and pedal"));
         undoTile.setTooltip (gr ("Delete loop: one press deletes the loop of the selected block, a quick double press deletes only the last overdub"));
-        stopTile.setTooltip ("Rec MIDI loop: " + gr ("one press = stop / play the loop of the selected block. Quick double press = mute / unmute only the second layer (overdub)"));
+        stopTile.setTooltip ("Rec MIDI loop: " + gr ("one press = stop (at the end of the loop) / play (from the start of the loop) of the selected block; press again before the end cancels the stop. Quick double press = mute / unmute only the second layer (overdub)"));
         tapeTile.setTooltip (gr ("Play all loops. Quick double press = stop all. Rec Audio: key A#0"));
         metroTile.setTooltip (gr ("Metronome (M key). Plays in mono on a separate output. Right-click: sound, output, key/pedal"));
 
@@ -5161,7 +5161,8 @@ private:
         {
             const bool selStopped = valid && engine.loopStoppedOut[(size_t) selected].load() != 0;
             stopTile.setSymbol (selStopped ? Symbol::Play : Symbol::Stop);
-            stopTile.setIconColour (selStopped ? hobby::mix (hobby::kPeach, tileWhite, blink) : loop != flow::loopOff ? tileWhite : dimGrey);
+            const bool selPend = valid && engine.loopStopPendOut[(size_t) selected].load() != 0;   // στοπ σε αναμονή (στο τέλος της λούπας): αναβοσβήνει
+            stopTile.setIconColour (selStopped || selPend ? hobby::mix (hobby::kPeach, tileWhite, blink) : loop != flow::loopOff ? tileWhite : dimGrey);
         }
         juce::ignoreUnused (mute, taps);
 
@@ -5447,7 +5448,7 @@ class FlowApplication : public JUCEApplication
 {
 public:
     const String getApplicationName() override    { return "Flow"; }
-    const String getApplicationVersion() override { return "0.90.24"; }
+    const String getApplicationVersion() override { return "0.90.25"; }
     bool moreThanOneInstanceAllowed() override    { return false; }
 
     void initialise (const String&) override
