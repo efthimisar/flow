@@ -3675,6 +3675,7 @@ private:
         else if (en.specialBlock.load() < 0) en.specialBlock = s;
         else if (en.specialBlock2.load() < 0) en.specialBlock2 = s;
         else { setMessage (gr ("Two special blocks are already set. Turn one off first")); return; }
+        en.shiftHeld = 0;   // η αλλαγή των special block ξεκινά πάντα με κλειστό το latch
         saveNow();
         refreshAll();
         keyboardView.repaint();
@@ -5446,7 +5447,7 @@ class FlowApplication : public JUCEApplication
 {
 public:
     const String getApplicationName() override    { return "Flow"; }
-    const String getApplicationVersion() override { return "0.90.22"; }
+    const String getApplicationVersion() override { return "0.90.23"; }
     bool moreThanOneInstanceAllowed() override    { return false; }
 
     void initialise (const String&) override

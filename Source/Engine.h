@@ -379,7 +379,8 @@ namespace flow
         std::array<std::atomic<int>, numBlocks> liveSilent;   // 1 = όσο παίζει η λούπα του block, το live του block μένει σιωπηλό (default). 0 = ακούγεται και το live.
         std::atomic<juce::uint32> lastVolMoveMs { 0 };
         std::atomic<int> volMoveDirty { 0 };
-        std::atomic<int> shiftHeld { 0 };       // sustain CC64 πατημένο: το ειδικό block παίρνει τα πλήκτρα της ζώνης του όσο το κρατάς
+        bool sustainWasDown = false;            // για το latch του sustain (μόνο το thread ήχου)
+        std::atomic<int> shiftHeld { 0 };       // ειδικό block ανοιχτό (latch από το sustain CC64): παίρνει τα πλήκτρα της ζώνης του μέχρι το επόμενο πάτημα
         std::atomic<int> specialBlock { -1 }, specialBlock2 { -1 };   // δύο ειδικά block (το καθένα με δική του ζώνη)
         bool isSp (int b) const { return b >= 0 && (b == specialBlock.load() || b == specialBlock2.load()); }
         //   // ειδικό block: πάνω από τα άλλα, παίζει στη ζώνη του όσο κρατιέται το sustain, έχει λούπα και εφέ (-1 = κανένα)
@@ -1916,7 +1917,11 @@ private:
                                   || (specialBlock2.load() >= 0 && specialBlock2.load() < numBlocks && active[(size_t) specialBlock2.load()].load() != 0);
                     if (has || shiftHeld.load() != 0)
                     {
-                        shiftHeld = (has && msg.getControllerValue() >= 64) ? 1 : 0;
+                        // latch: ένα πάτημα του sustain ανοίγει το ειδικό block και μένει, το δεύτερο πάτημα το κλείνει (το άφημα του πεταλιού δεν κάνει τίποτα)
+                        const bool down = msg.getControllerValue() >= 64;
+                        if (! has) shiftHeld = 0;
+                        else if (down && ! sustainWasDown) shiftHeld = shiftHeld.load() != 0 ? 0 : 1;
+                        sustainWasDown = down;
                         if (has) continue;
                     }
                 }
