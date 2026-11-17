@@ -421,13 +421,17 @@ namespace flow
             const auto now = juce::Time::getMillisecondCounter();
             const bool quick = now - lastPlayPressMs < (juce::uint32) tapMs.load();
             lastPlayPressMs = now;
-            loopsStopped = quick ? 1 : 0;
-            if (! quick) ++playAllGen;   // το Play ξαναπαίζει και τις λούπες που είχαν σταματήσει μεμονωμένα
+            loopsStopped = 0;
+            if (quick) ++stopAllGen;     // Stop όλων: περιμένει το τέλος της μεγαλύτερης λούπας (το υπολογίζει το thread ήχου)
+            else { stopAllAt = -1.0; ++playAllGen; }   // το Play ακυρώνει ένα Stop σε αναμονή και ξαναπαίζει και τις λούπες που είχαν σταματήσει μεμονωμένα
             ++changeCount;
         }
         juce::uint32 lastPlayPressMs = 0;
         std::atomic<int> playAllGen { 0 };
         std::atomic<int> loopsStopped { 0 };
+        std::atomic<int> stopAllGen { 0 };
+        std::atomic<double> stopAllAt { -1.0 };   // beat όπου θα σταματήσουν όλες οι λούπες (-1 = κανένα Stop σε αναμονή)
+        int seenStopAll = 0;
         void pressOverdub (int b) { if (b >= 0) rerecReq[(size_t) b] = 1; }   // overdub (μέχρι 2 στρώματα) ή κλείσιμό του
         void pressReRec (int b) { if (b >= 0) rerecReq[(size_t) b] = 1; }   // ξαναγράφω: σβήνει τη λούπα του block και ξεκινά νέα εγγραφή
         void tapFromUi()       { ++tapRequest; }
@@ -823,6 +827,27 @@ namespace flow
         std::atomic<int> sceneGridBars { 4 };
         std::atomic<double> scenePhaseOut { 0.0 }, sceneLeftBeatsOut { 0.0 };
 
+        // Stop όλων στο τέλος της μεγαλύτερης λούπας (η πιο μακριά ορίζει το τέλος)
+        void stopAllProcess (double beat0, double beat1)
+        {
+            const int g = stopAllGen.load();
+            if (g != seenStopAll)
+            {
+                seenStopAll = g;
+                if (stopAllAt.load() >= 0.0) stopAllAt = -1.0;   // δεύτερο Stop πριν το τέλος: ακυρώνει
+                else
+                {
+                    const double cyc = playCycle(), anc = playCycleAnchor();
+                    bool any = false;
+                    for (const auto& B : blocks) if (B.plugin != nullptr && B.loopBeats > 0.0 && (B.loopState == loopPlay || B.loopState == loopOver)) any = true;
+                    if (! any) loopsStopped = 1;
+                    else stopAllAt = anc + std::ceil ((beat0 - anc) / cyc - 1.0e-9) * cyc;
+                }
+            }
+            const double at = stopAllAt.load();
+            if (at >= 0.0 && at < beat1) { loopsStopped = 1; stopAllAt = -1.0; ++changeCount; }
+        }
+
         // στο τέλος κάθε block ήχου: αν πέρασε το όριο της φράσης, γίνεται η αλλαγή σκηνής
         void sceneProcess (double beat0, double beat1)
         {
@@ -837,6 +862,7 @@ namespace flow
             if (p == nullptr) return;
             if (nb >= beat1) return;
             sceneSwapLocked (*p);
+            stopAllAt = -1.0;   // ένα Stop όλων σε αναμονή ακυρώνεται με την αλλαγή σκηνής
             scenePend = nullptr;
             ++sceneDone;
         }
@@ -2046,6 +2072,7 @@ private:
             }
             asProcess (blkBeat0, blkBeat0 + (double) numSamples * blkBps, (double) numSamples / sr);
             sceneProcess (blkBeat0, blkBeat0 + (double) numSamples * blkBps);
+            stopAllProcess (blkBeat0, blkBeat0 + (double) numSamples * blkBps);
         }
 
         // πετάλια και πλήκτρα ελέγχου: επιστρέφει true αν το μήνυμα το κατανάλωσε η ανάθεση (δεν πάει στα plugins)
@@ -3524,7 +3551,7 @@ private:
                             for (double m = std::floor ((beat0 - B.loopAnchor) / L); m <= std::floor ((beat1 - 1.0e-9 - B.loopAnchor) / L); m += 1.0)
                             {
                                 const double x = B.loopAnchor + m * L + e.phase;
-                                if (x >= beat0 && x < beat1 && (B.stopLoopAt < 0.0 || x < B.stopLoopAt - 1.0e-9) && (B.playAt < 0.0 || x >= B.playAt - 1.0e-9)) push (x, e);
+                                if (x >= beat0 && x < beat1 && (B.stopLoopAt < 0.0 || x < B.stopLoopAt - 1.0e-9) && (stopAllAt.load() < 0.0 || x < stopAllAt.load() - 1.0e-9) && (B.playAt < 0.0 || x >= B.playAt - 1.0e-9)) push (x, e);
                             }
                     }
                     else if (B.layerStart[ul] >= 0.0)   // once / hold at end: παίζει μία φορά από την αρχή του και μετά περιμένει
