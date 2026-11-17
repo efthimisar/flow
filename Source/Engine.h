@@ -416,22 +416,12 @@ namespace flow
         void pressStop (int b) { ++cmdStop[(size_t) b]; }
         void pressMute (int b) { ++cmdMute[(size_t) b]; }
         // Play όλων των λουπών με ένα πάτημα, γρήγορο διπλό πάτημα = Stop όλων (ξαναπαίζουν συγχρονισμένες στη φάση τους)
-        void pressPlayStop()
-        {
-            const auto now = juce::Time::getMillisecondCounter();
-            const bool quick = now - lastPlayPressMs < (juce::uint32) tapMs.load();
-            lastPlayPressMs = now;
-            loopsStopped = 0;
-            if (quick) ++stopAllGen;     // Stop όλων: περιμένει το τέλος της μεγαλύτερης λούπας (το υπολογίζει το thread ήχου)
-            else { stopAllAt = -1.0; ++playAllGen; }   // το Play ακυρώνει ένα Stop σε αναμονή και ξαναπαίζει και τις λούπες που είχαν σταματήσει μεμονωμένα
-            ++changeCount;
-        }
-        juce::uint32 lastPlayPressMs = 0;
+        void pressPlayStop() { ++tapeCmd; }   // η απόφαση (ένα / δύο πατήματα) παίρνεται στο thread ήχου, βλ. stopAllProcess
+        std::atomic<int> tapeCmd { 0 };
+        int seenTape = 0, tapeTaps = 0; juce::uint32 tapeLastMs = 0;
         std::atomic<int> playAllGen { 0 };
         std::atomic<int> loopsStopped { 0 };
-        std::atomic<int> stopAllGen { 0 };
         std::atomic<double> stopAllAt { -1.0 };   // beat όπου θα σταματήσουν όλες οι λούπες (-1 = κανένα Stop σε αναμονή)
-        int seenStopAll = 0;
         void pressOverdub (int b) { if (b >= 0) rerecReq[(size_t) b] = 1; }   // overdub (μέχρι 2 στρώματα) ή κλείσιμό του
         void pressReRec (int b) { if (b >= 0) rerecReq[(size_t) b] = 1; }   // ξαναγράφω: σβήνει τη λούπα του block και ξεκινά νέα εγγραφή
         void tapFromUi()       { ++tapRequest; }
@@ -827,22 +817,36 @@ namespace flow
         std::atomic<int> sceneGridBars { 4 };
         std::atomic<double> scenePhaseOut { 0.0 }, sceneLeftBeatsOut { 0.0 };
 
-        // Stop όλων στο τέλος της μεγαλύτερης λούπας (η πιο μακριά ορίζει το τέλος)
+        // Μπλε κουμπί (όλες οι λούπες). Στο thread ήχου, με το παράθυρο διπλού πατήματος:
+        //   ένα πάτημα: αν είναι σταματημένες (ή κάποια λούπα είχε σταματήσει μεμονωμένα) → Play όλων, αλλιώς → Stop αμέσως
+        //   δύο πατήματα: Stop στο τέλος της μεγαλύτερης λούπας (η πιο μακριά ορίζει το τέλος)· αν περιμένει ήδη, ακυρώνεται· αν είναι σταματημένες → Play
         void stopAllProcess (double beat0, double beat1)
         {
-            const int g = stopAllGen.load();
-            if (g != seenStopAll)
+            const auto now = juce::Time::getMillisecondCounter();
+            for (int c = tapeCmd.load(); seenTape != c; )
             {
-                seenStopAll = g;
-                if (stopAllAt.load() >= 0.0) stopAllAt = -1.0;   // δεύτερο Stop πριν το τέλος: ακυρώνει
-                else
+                ++seenTape;
+                if (now - tapeLastMs > (juce::uint32) tapMs.load()) tapeTaps = 0;
+                ++tapeTaps;
+                tapeLastMs = now;
+            }
+            if (tapeTaps > 0 && now - tapeLastMs > (juce::uint32) tapMs.load())
+            {
+                const int taps = tapeTaps; tapeTaps = 0;
+                const bool stopped = loopsStopped.load() != 0, pend = stopAllAt.load() >= 0.0;
+                bool anyLoop = false, anyUserStopped = false;
+                for (const auto& B : blocks)
+                    if (B.plugin != nullptr && B.loopBeats > 0.0 && (B.loopState == loopPlay || B.loopState == loopOver))
+                    { anyLoop = true; if (B.userStopped) anyUserStopped = true; }
+                stopAllAt = -1.0;
+                if (stopped || (taps == 1 && anyUserStopped && ! pend)) { loopsStopped = 0; ++playAllGen; }   // Play όλων
+                else if (taps == 1 || ! anyLoop) loopsStopped = 1;                                              // Stop αμέσως
+                else if (! pend)                                                                                 // Stop στο τέλος της μεγαλύτερης λούπας
                 {
                     const double cyc = playCycle(), anc = playCycleAnchor();
-                    bool any = false;
-                    for (const auto& B : blocks) if (B.plugin != nullptr && B.loopBeats > 0.0 && (B.loopState == loopPlay || B.loopState == loopOver)) any = true;
-                    if (! any) loopsStopped = 1;
-                    else stopAllAt = anc + std::ceil ((beat0 - anc) / cyc - 1.0e-9) * cyc;
+                    stopAllAt = anc + std::ceil ((beat0 - anc) / cyc - 1.0e-9) * cyc;
                 }
+                ++changeCount;
             }
             const double at = stopAllAt.load();
             if (at >= 0.0 && at < beat1) { loopsStopped = 1; stopAllAt = -1.0; ++changeCount; }
