@@ -76,7 +76,7 @@ public:
         folderTile.setTooltip (gr ("Settings: sets, audio and MIDI, master volume, Rec Audio folder, Link, Panic"));
         recTile.setTooltip ("Rec MIDI loop: " + gr ("records the loop of the selected block (the number inside the circle). Press again = end. If the block already has a loop, it starts an overdub (up to 2 layers); press again to end it. Right-click: quantize and pedal"));
         undoTile.setTooltip (gr ("Delete loop: one press deletes the loop of the selected block, a quick double press deletes only the last overdub"));
-        stopTile.setTooltip ("Rec MIDI loop: " + gr ("stop / play the loop of the selected block. Right-click: mute pedal"));
+        stopTile.setTooltip ("Rec MIDI loop: " + gr ("one press = stop / play the loop of the selected block. Quick double press = mute / unmute only the second layer (overdub)"));
         tapeTile.setTooltip (gr ("Play all loops. Quick double press = stop all. Rec Audio: key A#0"));
         metroTile.setTooltip (gr ("Metronome (M key). Plays in mono on a separate output. Right-click: sound, output, key/pedal"));
 
@@ -5447,7 +5447,7 @@ class FlowApplication : public JUCEApplication
 {
 public:
     const String getApplicationName() override    { return "Flow"; }
-    const String getApplicationVersion() override { return "0.90.23"; }
+    const String getApplicationVersion() override { return "0.90.24"; }
     bool moreThanOneInstanceAllowed() override    { return false; }
 
     void initialise (const String&) override

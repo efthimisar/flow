@@ -1220,7 +1220,7 @@ namespace flow
             unsigned muteMask = 0;
             int seenMain = 0, seenUndo = 0, seenStop = 0, seenMute = 0, seenPanic = 0, taps = 0;
             bool stopped = false, stopTapValid = false, mfxLogged = false, userStopped = false;
-            int undoTaps = 0, seenPlayAll = 0; int64_t undoLastT = 0;
+            int undoTaps = 0, stopTaps = 0, seenPlayAll = 0; int64_t undoLastT = 0, stopLastT = 0;
             int64_t lastStopTap = 0;
             unsigned loopSusMask = 0, loopBendMask = 0;
             int64_t lastTap = 0;
@@ -1262,7 +1262,7 @@ namespace flow
                 rec.clear();
                 for (auto& l : layerEv) l.clear();
                 layerMode.fill (0); layerStart.fill (-1.0); layerArm.fill (-1.0); curMode = 0;
-                nLayers = 0; muteMask = 0; taps = 0; lastTap = 0; stopped = false; userStopped = false; undoTaps = 0; stopTapValid = false; loopSusMask = 0; loopBendMask = 0;
+                nLayers = 0; muteMask = 0; taps = 0; lastTap = 0; stopped = false; userStopped = false; undoTaps = 0; stopTaps = 0; stopTapValid = false; loopSusMask = 0; loopBendMask = 0;
                 out.clear();
             }
         };
@@ -3391,7 +3391,26 @@ private:
                 }
             }
             if (B.seenPlayAll != playAllGen.load()) { B.seenPlayAll = playAllGen.load(); B.userStopped = false; }
-            for (int cs = cmdStop[(size_t) b].load(); B.seenStop != cs; ) { ++B.seenStop; B.userStopped = ! B.userStopped; }   // στοπ / play της λούπας του block
+            {   // στοπ / play: ένα πάτημα = στοπ ή play της λούπας του block, γρήγορο διπλό πάτημα = σίγαση / ενεργοποίηση μόνο του δεύτερου στρώματος (overdub)
+                const int64_t swin = (int64_t) (sr * 0.001 * (double) tapMs.load());
+                for (int cs = cmdStop[(size_t) b].load(); B.seenStop != cs; )
+                {
+                    ++B.seenStop;
+                    if (gs - B.stopLastT > swin) B.stopTaps = 0;
+                    ++B.stopTaps;
+                    B.stopLastT = gs;
+                }
+                if (B.stopTaps > 0 && gs - B.stopLastT > swin)
+                {
+                    if (B.stopTaps >= 2 && B.loopState == loopPlay && B.nLayers > 1)
+                    {
+                        B.muteMask ^= 2u;   // το δεύτερο στρώμα τρέχει σιωπηλά και γυρίζει συγχρονισμένο
+                        cutLoopNotes (B);
+                    }
+                    else B.userStopped = ! B.userStopped;
+                    B.stopTaps = 0;
+                }
+            }
             {   // σταματούν με κομμένες νότες και ξαναμπαίνουν στη φάση τους (κουμπί του block ή Play/Stop όλων)
                 const bool st = B.userStopped || loopsStopped.load() != 0;
                 if (st != B.stopped)
