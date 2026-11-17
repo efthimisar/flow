@@ -1008,6 +1008,7 @@ private:
             chooseAndLoadPlugin (true);
             return;
         }
+        loopsView.getList().close();   // αν είχε μείνει ανοιχτή η λίστα επιλογής MIDI FX / FX χωρίς επιλογή, το VST γυρίζει στην οθόνη του instrument
         const bool same = panelMode == panelInstrument;
         if (panelMode == panelMaster) header.onMaster();   // επιστροφή από το master
         panelMode = panelInstrument;
@@ -1020,6 +1021,7 @@ private:
         if (! isActive (selected)) { setMessage (gr ("Load an instrument (VST) first")); return; }
         if (engine.getMidiFx (selected) != nullptr)
         {
+            loopsView.getList().close();
             const bool same = panelMode == panelMidiFx;
             panelMode = panelMidiFx;
             updateEditor();
@@ -1036,6 +1038,7 @@ private:
         if (! isActive (selected)) { setMessage (gr ("Load an instrument (VST) first")); return; }
         if (engine.numFx (selected) > 0)
         {
+            loopsView.getList().close();
             const bool same = panelMode == panelFx;
             panelMode = panelFx;
             panelIndex = jlimit (0, engine.numFx (selected) - 1, panelIndex);
@@ -5448,7 +5451,7 @@ class FlowApplication : public JUCEApplication
 {
 public:
     const String getApplicationName() override    { return "Flow"; }
-    const String getApplicationVersion() override { return "0.90.27"; }
+    const String getApplicationVersion() override { return "0.90.28"; }
     bool moreThanOneInstanceAllowed() override    { return false; }
 
     void initialise (const String&) override
