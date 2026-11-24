@@ -1076,6 +1076,8 @@ namespace flow
                 B.scratch.clear();
                 juce::AudioBuffer<float> view (B.scratch.getArrayOfWritePointers(), B.scratch.getNumChannels(), numSamples);
                 const juce::int64 tb0 = juce::Time::getHighResolutionTicks();
+                recorder.setTempo (blkBps * sr * 60.0);
+                recorder.recordMidi (b, B.out);   // Rec Audio: τα MIDI του block μπαίνουν στο zip
                 B.plugin->processBlock (view, B.out);
                 const juce::int64 tb1 = juce::Time::getHighResolutionTicks();
 

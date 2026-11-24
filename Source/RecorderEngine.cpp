@@ -86,6 +86,10 @@ void RecorderEngine::prepare (double sr)
     fifo.reset();
     fifoBuf.setSize (kChannels, cap);
     fifoBuf.clear();
+    midiRing.assign (16384, MidiEv());
+    midiFifo.setTotalSize ((int) midiRing.size());
+    midiFifo.reset();
+    framesPushed = 0; framesConsumed = 0;
     preRollLen = (int) std::ceil (kPreRollSeconds * sr);
     preRoll.setSize (kChannels, preRollLen);
     preRoll.clear();
@@ -136,6 +140,79 @@ void RecorderEngine::process (const juce::AudioBuffer<float>& buffer, const juce
         }
     }
     fifo.finishedWrite (n1 + n2);
+    framesPushed.fetch_add (n, std::memory_order_relaxed);
+}
+
+void RecorderEngine::recordMidi (int block, const juce::MidiBuffer& events)
+{
+    if (! prepared.load (std::memory_order_acquire) || getState() != State::Recording || block < 0 || block >= kStems) return;
+    const int64_t base = framesPushed.load (std::memory_order_relaxed);   // αρχή του τρέχοντος block ήχου (το process() του ίδιου block έρχεται μετά)
+    for (const auto meta : events)
+    {
+        const auto m = meta.getMessage();
+        const int n = m.getRawDataSize();
+        if (n < 2 || n > 3) continue;
+        const auto* d = m.getRawData();
+        const int st = d[0] & 0xf0;
+        const bool keep = st == 0x80 || st == 0x90 || st == 0xe0 || st == 0xd0 || st == 0xa0 || (st == 0xb0 && d[1] < 120);   // νότες, pitch bend, πίεση, CC (όχι all notes/sound off)
+        if (! keep) continue;
+        int s1, n1, s2, n2;
+        midiFifo.prepareToWrite (1, s1, n1, s2, n2);
+        if (n1 + n2 < 1) { midiDropped.fetch_add (1); continue; }
+        auto& e = midiRing[(size_t) (n1 > 0 ? s1 : s2)];
+        e.frame = base + meta.samplePosition; e.block = (uint8_t) block; e.b0 = d[0]; e.b1 = d[1]; e.b2 = n > 2 ? d[2] : 0;
+        midiFifo.finishedWrite (1);
+    }
+}
+
+void RecorderEngine::drainMidi()
+{
+    for (;;)
+    {
+        const int ready = midiFifo.getNumReady();
+        if (ready <= 0) break;
+        int s1, n1, s2, n2;
+        midiFifo.prepareToRead (ready, s1, n1, s2, n2);
+        const bool rec = getState() == State::Recording && writer != nullptr;
+        auto take = [&] (int start, int cnt)
+        {
+            for (int i = 0; i < cnt; ++i)
+            {
+                const auto& e = midiRing[(size_t) (start + i)];
+                if (rec && e.frame >= takeStartFrame && e.block < kStems) takeMidi[e.block].push_back (e);
+            }
+        };
+        take (s1, n1); take (s2, n2);
+        midiFifo.finishedRead (n1 + n2);
+    }
+}
+
+bool RecorderEngine::writeMidiFile (int block, const juce::File& f)
+{
+    constexpr int ppq = 960;
+    juce::MidiMessageSequence seq;
+    const double sr = juce::jmax (1.0, sampleRate.load());
+    const double ticksPerSec = takeBpm / 60.0 * ppq;
+    seq.addEvent (juce::MidiMessage::tempoMetaEvent ((int) std::llround (60000000.0 / takeBpm)), 0.0);
+    for (const auto& e : takeMidi[block])
+    {
+        const uint8_t raw[3] = { e.b0, e.b1, e.b2 };
+        const int len = ((e.b0 & 0xf0) == 0xc0 || (e.b0 & 0xf0) == 0xd0) ? 2 : 3;
+        seq.addEvent (juce::MidiMessage (raw, len, 0.0), std::round ((double) (e.frame - takeStartFrame) / sr * ticksPerSec));
+    }
+    seq.updateMatchedPairs();
+    juce::MidiFile mf;
+    mf.setTicksPerQuarterNote (ppq);
+    mf.addTrack (seq);
+    juce::TemporaryFile tmp (f);
+    {
+        juce::FileOutputStream out (tmp.getFile());
+        if (! out.openedOk()) return false;
+        out.setPosition (0); out.truncate();
+        if (! mf.writeTo (out)) return false;
+        out.flush();
+    }
+    return tmp.overwriteTargetFileWithTemporary();
 }
 
 void RecorderEngine::setFolder (const juce::File& f) { const juce::ScopedLock sl (fileLock); folder = f; }
@@ -190,6 +267,9 @@ void RecorderEngine::packZip()
     juce::ZipFile::Builder builder;
     builder.addFile (masterFile, 0, "Master.wav");
     for (int b = 0; b < kStems; ++b)
+        if (! takeMidi[b].empty() && writeMidiFile (b, midiFile[b]))
+            builder.addFile (midiFile[b], 0, "Block " + juce::String (b + 1).paddedLeft ('0', 2) + ".mid");
+    for (int b = 0; b < kStems; ++b)
         if ((takeMask >> b) & 1u && stemFile[b].existsAsFile())
             builder.addFile (stemFile[b], 0, "Block " + juce::String (b + 1).paddedLeft ('0', 2) + ".wav");
 
@@ -208,7 +288,7 @@ void RecorderEngine::packZip()
     if (ok)
     {
         masterFile.deleteFile();
-        for (int b = 0; b < kStems; ++b) stemFile[b].deleteFile();
+        for (int b = 0; b < kStems; ++b) { stemFile[b].deleteFile(); midiFile[b].deleteFile(); }
     }
     {
         const juce::ScopedLock sl (fileLock);
@@ -219,6 +299,7 @@ void RecorderEngine::packZip()
 
 void RecorderEngine::finishTake (bool full)
 {
+    drainMidi();   // τα τελευταία MIDI πριν κλείσει το take
     bool ok = true;
     closeWriters (ok);
     if (ok) packZip();
@@ -237,6 +318,11 @@ void RecorderEngine::startTake()
     auto w = std::make_unique<WavWriter> (masterFile, sampleRate.load());
     if (! w->ok()) { enterError(); return; }
 
+    for (auto& v : takeMidi) v.clear();
+    drainMidi();                                  // ό,τι ήρθε πριν το πάτημα δεν ανήκει στο take
+    takeStartFrame = framesConsumed;              // η πρώτη στιγμή του WAV
+    takeBpm = juce::jlimit (20.0, 400.0, tempoBpm.load());
+    for (int b = 0; b < kStems; ++b) midiFile[b] = dir.getChildFile (base.getFileName() + "_block" + juce::String (b + 1).paddedLeft ('0', 2) + ".mid");
     takeMask = stemMaskNow.load();
     for (int b = 0; b < kStems; ++b)
     {
@@ -278,6 +364,7 @@ void RecorderEngine::workerStep()
         }
     }
 
+    drainMidi();
     for (;;)
     {
         const int ready = fifo.getNumReady();
@@ -292,6 +379,7 @@ void RecorderEngine::workerStep()
         }
         fifo.finishedRead (n1 + n2);
         const int cnt = n1 + n2;
+        framesConsumed += cnt;
         const float* l = chunk.getReadPointer (0);
         const float* r = chunk.getReadPointer (1);
 

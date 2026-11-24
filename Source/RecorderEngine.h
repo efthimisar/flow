@@ -32,6 +32,10 @@ public:
     void setFolder (const juce::File& f);
     juce::File getFolder() const;
     void pressButton();                                  // stop ή νέο take
+
+    // audio thread: τα MIDI που παίρνει κάθε block (νότες, CC, pitch bend) κατά τη λήψη· πάνε στο zip ως Block NN.mid
+    void setTempo (double bpm) noexcept { tempoBpm.store (bpm, std::memory_order_relaxed); }
+    void recordMidi (int block, const juce::MidiBuffer& events);
     State  getState() const noexcept        { return (State) state.load(); }
     bool   isTapeFull() const noexcept      { return tapeFull.load(); }
     double getElapsedSeconds() const noexcept { return (double) framesWritten.load() / juce::jmax (1.0, sampleRate.load()); }
@@ -57,12 +61,26 @@ private:
     bool writeRange (const juce::AudioBuffer<float>& src, int start, int n);
     void closeWriters (bool& ok);
     void packZip();
+    void drainMidi();
+    bool writeMidiFile (int block, const juce::File& f);
 
     // FIFO audio → worker
     juce::AbstractFifo fifo { 1 };
     juce::AudioBuffer<float> fifoBuf;
     std::atomic<int> dropped { 0 };
     std::atomic<uint32_t> stemMaskNow { 0 };
+
+    // MIDI audio thread → worker. frame = θέση στη ροή του FIFO ήχου (ίδια χρονική βάση με το WAV)
+    struct MidiEv { int64_t frame = 0; uint8_t block = 0, b0 = 0, b1 = 0, b2 = 0; };
+    juce::AbstractFifo midiFifo { 1 };
+    std::vector<MidiEv> midiRing;
+    std::atomic<int64_t> framesPushed { 0 };
+    std::atomic<double> tempoBpm { 120.0 };
+    std::atomic<int> midiDropped { 0 };
+    int64_t framesConsumed = 0, takeStartFrame = 0;   // μόνο worker
+    double takeBpm = 120.0;
+    std::vector<MidiEv> takeMidi[kStems];
+    juce::File midiFile[kStems];
 
     // pre-roll (μόνο worker)
     juce::AudioBuffer<float> preRoll;
