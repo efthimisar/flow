@@ -89,6 +89,11 @@ void RecorderEngine::prepare (double sr)
     midiRing.assign (16384, MidiEv());
     midiFifo.setTotalSize ((int) midiRing.size());
     midiFifo.reset();
+    infoRing.assign (4096, InfoEv());
+    infoFifo.setTotalSize ((int) infoRing.size());
+    infoFifo.reset();
+    lastBpm = -1.0; lastScene = -1;
+    for (int b = 0; b < kStems; ++b) { lastOff[b] = lastStop[b] = lastMute[b] = -1; }
     framesPushed = 0; framesConsumed = 0;
     preRollLen = (int) std::ceil (kPreRollSeconds * sr);
     preRoll.setSize (kChannels, preRollLen);
@@ -163,6 +168,209 @@ void RecorderEngine::recordMidi (int block, const juce::MidiBuffer& events)
         e.frame = base + meta.samplePosition; e.block = (uint8_t) block; e.b0 = d[0]; e.b1 = d[1]; e.b2 = n > 2 ? d[2] : 0;
         midiFifo.finishedWrite (1);
     }
+}
+
+void RecorderEngine::trackState (double bpm, const int* off, const int* stopped, const int* mute, int scene)
+{
+    if (! prepared.load (std::memory_order_acquire)) return;
+    const int64_t base = framesPushed.load (std::memory_order_relaxed);
+    auto push = [&] (uint8_t type, int block, int iv, float fv)
+    {
+        int s1, n1, s2, n2;
+        infoFifo.prepareToWrite (1, s1, n1, s2, n2);
+        if (n1 + n2 < 1) return;
+        auto& e = infoRing[(size_t) (n1 > 0 ? s1 : s2)];
+        e.frame = base; e.type = type; e.block = (uint8_t) block; e.iv = iv; e.fv = fv;
+        infoFifo.finishedWrite (1);
+    };
+    if (std::abs (bpm - lastBpm) > 0.005) { lastBpm = bpm; push (0, 0, 0, (float) bpm); }
+    for (int b = 0; b < kStems; ++b)
+    {
+        if (off[b]     != lastOff[b])  { lastOff[b]  = off[b];     push (1, b, off[b], 0.0f); }
+        if (mute[b]    != lastMute[b]) { lastMute[b] = mute[b];    push (2, b, mute[b], 0.0f); }
+        if (stopped[b] != lastStop[b]) { lastStop[b] = stopped[b]; push (3, b, stopped[b], 0.0f); }
+    }
+    if (scene != lastScene) { lastScene = scene; push (4, 0, scene, 0.0f); }
+}
+
+void RecorderEngine::drainInfo (bool atStart)
+{
+    const bool rec = atStart || (getState() == State::Recording && writer != nullptr);
+    for (;;)
+    {
+        const int ready = infoFifo.getNumReady();
+        if (ready <= 0) break;
+        int s1, n1, s2, n2;
+        infoFifo.prepareToRead (ready, s1, n1, s2, n2);
+        auto take = [&] (int start, int cnt)
+        {
+            for (int i = 0; i < cnt; ++i)
+            {
+                const auto& e = infoRing[(size_t) (start + i)];
+                if (rec && e.frame >= takeStartFrame) { takeInfo.push_back (e); continue; }
+                if (e.block >= kStems) continue;
+                switch (e.type)   // ό,τι έγινε πριν από το take ορίζει την αρχική κατάσταση
+                {
+                    case 0: curBpm = e.fv; break;
+                    case 1: curOff[e.block] = e.iv; break;
+                    case 2: curMute[e.block] = e.iv; break;
+                    case 3: curStop[e.block] = e.iv; break;
+                    case 4: curScene = e.iv; break;
+                    default: break;
+                }
+            }
+        };
+        take (s1, n1); take (s2, n2);
+        infoFifo.finishedRead (n1 + n2);
+    }
+}
+
+static juce::var newObj() { return juce::var (new juce::DynamicObject()); }
+static void setP (juce::var& o, const char* k, const juce::var& v) { o.getDynamicObject()->setProperty (k, v); }
+static juce::String blockFile (int b, const char* ext) { return "Block " + juce::String (b + 1).paddedLeft ('0', 2) + ext; }
+
+juce::var RecorderEngine::buildPaintJson()
+{
+    const double sr = juce::jmax (1.0, sampleRate.load());
+    const juce::var info = infoEnd, infoS = infoStart;
+    static const char* groupNames[] = { "percussion", "bass_arp", "pads_strings", "keys", "solo", "fx" };
+    static const char* seqNames[] = { "auto", "flow", "plugin" };
+    (void) seqNames;
+
+    // tempo map: θέση σε samples και beats
+    struct Seg { int64_t f; double bpm, beat; };
+    std::vector<Seg> segs { { 0, initBpm, 0.0 } };
+    juce::Array<juce::var> changes;
+    for (const auto& e : takeInfo)
+    {
+        if (e.type != 0) continue;
+        const int64_t rel = e.frame - takeStartFrame;
+        const auto& pv = segs.back();
+        const double beat = pv.beat + (double) (rel - pv.f) / sr * pv.bpm / 60.0;
+        segs.push_back ({ rel, (double) e.fv, beat });
+        auto c = newObj(); setP (c, "sample", (juce::int64) rel); setP (c, "beat", beat); setP (c, "bpm", (double) e.fv);
+        changes.add (c);
+    }
+    auto beatAt = [&] (int64_t rel)
+    {
+        const Seg* sg = &segs[0];
+        for (const auto& x : segs) if (x.f <= rel) sg = &x;
+        return sg->beat + (double) (rel - sg->f) / sr * sg->bpm / 60.0;
+    };
+
+    auto hasPlugin = [&] (int b) { return (bool) info["blocks"][b]["plugin"]; };
+
+    // γεγονότα ανά block + σκηνές (με τα ενεργά blocks εκείνη τη στιγμή)
+    juce::Array<juce::var> mute[kStems];
+    int sOff[kStems], sStop[kStems], sMute[kStems], sScene = initScene;
+    for (int b = 0; b < kStems; ++b)
+    {
+        sOff[b] = initOff[b]; sStop[b] = initStop[b]; sMute[b] = initMute[b];
+        auto add = [&] (const char* kind, bool muted, int mask, int64_t rel, const char* src)
+        {
+            auto m = newObj(); setP (m, "sample", (juce::int64) rel); setP (m, "beat", beatAt (rel)); setP (m, "kind", kind);
+            setP (m, "muted", muted); if (mask >= 0) setP (m, "mask", mask); setP (m, "source", src);
+            mute[b].add (m);
+        };
+        if (initOff[b])  add ("block_off", true, -1, 0, "initial");
+        if (initStop[b]) add ("stopped", true, -1, 0, "initial");
+        if (initMute[b]) add ("layer_mute", true, initMute[b], 0, "initial");
+    }
+    auto activeList = [&]
+    {
+        juce::Array<juce::var> a;
+        for (int b = 0; b < kStems; ++b) if (hasPlugin (b) && ! sOff[b] && ! sStop[b]) a.add (b + 1);
+        return a;
+    };
+    juce::Array<juce::var> arrangement;
+    {
+        auto a = newObj(); setP (a, "beat", 0.0); setP (a, "sample", (juce::int64) 0); setP (a, "event", "scene");
+        setP (a, "scene", initScene + 1); setP (a, "name", juce::var()); setP (a, "active_blocks", activeList()); setP (a, "source", "initial");
+        arrangement.add (a);
+    }
+    for (const auto& e : takeInfo)
+    {
+        const int64_t rel = e.frame - takeStartFrame;
+        if (e.type == 0 || e.block >= kStems) continue;
+        const int b = e.block;
+        auto add = [&] (const char* kind, bool muted, int mask)
+        {
+            auto m = newObj(); setP (m, "sample", (juce::int64) rel); setP (m, "beat", beatAt (rel)); setP (m, "kind", kind);
+            setP (m, "muted", muted); if (mask >= 0) setP (m, "mask", mask); setP (m, "source", "flow");
+            mute[b].add (m);
+        };
+        if (e.type == 1) { sOff[b] = e.iv; add ("block_off", e.iv != 0, -1); }
+        else if (e.type == 2) { sMute[b] = e.iv; add ("layer_mute", e.iv != 0, e.iv); }
+        else if (e.type == 3) { sStop[b] = e.iv; add ("stopped", e.iv != 0, -1); }
+        else if (e.type == 4)
+        {
+            sScene = e.iv;
+            auto a = newObj(); setP (a, "beat", beatAt (rel)); setP (a, "sample", (juce::int64) rel); setP (a, "event", "scene");
+            setP (a, "scene", e.iv + 1); setP (a, "name", juce::var()); setP (a, "active_blocks", activeList()); setP (a, "source", "flow");
+            arrangement.add (a);
+        }
+    }
+    (void) sScene; (void) sMute;
+
+    juce::Array<juce::var> blocks;
+    for (int b = 0; b < kStems; ++b)
+    {
+        const bool inTake = (takeMask >> b) & 1u;
+        if (! hasPlugin (b) && ! inTake) continue;
+        int notes = 0;
+        for (const auto& e : takeMidi[b]) if ((e.b0 & 0xf0) == 0x90 && e.b2 > 0) ++notes;
+
+        auto B = newObj();
+        setP (B, "index", b + 1);
+        setP (B, "name", "Block " + juce::String (b + 1).paddedLeft ('0', 2));
+        const int g = (int) info["blocks"][b]["group"];
+        setP (B, "group", info["blocks"][b]["group"].isVoid() || g < 0 || g > 5 ? juce::var() : juce::var (juce::String (groupNames[g])));
+        setP (B, "role", juce::var());
+        auto ins = newObj(); setP (ins, "type", juce::var()); setP (ins, "name", info["blocks"][b]["name"]); setP (ins, "preset", juce::var());
+        setP (B, "instrument", ins);
+        setP (B, "stem", inTake && stemFile[b].existsAsFile() ? juce::var (blockFile (b, ".wav")) : juce::var());
+        setP (B, "stem_dry", juce::var());
+        setP (B, "midi", notes > 0 ? juce::var (blockFile (b, ".mid")) : juce::var());
+        setP (B, "midi_note_on_count", notes);
+        setP (B, "midi_note", juce::var());
+        setP (B, "pan", juce::var());
+        setP (B, "volume_db", infoS["blocks"][b]["volume_db"]);
+        setP (B, "mute_events", mute[b]);
+        setP (B, "loop", info["blocks"][b]["loop"]);
+        setP (B, "fx", juce::var());
+        setP (B, "fx_changes", juce::var());
+        setP (B, "fx_chain", info["blocks"][b]["fx_chain"]);
+
+        const int sq = (int) info["blocks"][b]["seq"];
+        juce::var seq; bool inferred = false;
+        if (sq == 1) seq = "flow";
+        else if (sq == 2) seq = "plugin";
+        else { inferred = true; if (notes > 0) seq = "flow"; else if (takeStemPeak[b] > 0.003f) seq = "plugin"; }
+        setP (B, "sequencer", seq);
+        setP (B, "sequencer_inferred", inferred);
+        blocks.add (B);
+    }
+
+    auto root = newObj();
+    setP (root, "version", 1);
+    setP (root, "flow_version", info["flow_version"]);
+    auto rec = newObj();
+    setP (rec, "kind", "rec_audio"); setP (rec, "sample_rate", sr); setP (rec, "bit_depth", 24);
+    setP (rec, "length_samples", (juce::int64) takeLength); setP (rec, "start_wallclock", takeStartTime.toISO8601 (true));
+    setP (rec, "latency_samples", juce::var());
+    setP (root, "recording", rec);
+    auto tempo = newObj();
+    setP (tempo, "bpm", initBpm);
+    juce::Array<juce::var> ts; ts.add (4); ts.add (4);
+    setP (tempo, "time_signature", ts);
+    setP (tempo, "changes", changes);
+    setP (root, "tempo", tempo);
+    auto master = newObj();
+    setP (master, "file", "Master.wav"); setP (master, "reverb_send_return", juce::var()); setP (master, "limiter", info["limiter"]);
+    setP (root, "master", master);
+    setP (root, "blocks", blocks);
+    setP (root, "arrangement", arrangement);
+    return root;
 }
 
 void RecorderEngine::drainMidi()
@@ -267,11 +475,18 @@ void RecorderEngine::packZip()
     juce::ZipFile::Builder builder;
     builder.addFile (masterFile, 0, "Master.wav");
     for (int b = 0; b < kStems; ++b)
-        if (! takeMidi[b].empty() && writeMidiFile (b, midiFile[b]))
-            builder.addFile (midiFile[b], 0, "Block " + juce::String (b + 1).paddedLeft ('0', 2) + ".mid");
+    {
+        int notes = 0;
+        for (const auto& e : takeMidi[b]) if ((e.b0 & 0xf0) == 0x90 && e.b2 > 0) ++notes;
+        if (notes > 0 && writeMidiFile (b, midiFile[b]))   // .mid μόνο όταν υπάρχει τουλάχιστον μία νότα
+            builder.addFile (midiFile[b], 0, blockFile (b, ".mid"));
+    }
     for (int b = 0; b < kStems; ++b)
         if ((takeMask >> b) & 1u && stemFile[b].existsAsFile())
-            builder.addFile (stemFile[b], 0, "Block " + juce::String (b + 1).paddedLeft ('0', 2) + ".wav");
+            builder.addFile (stemFile[b], 0, blockFile (b, ".wav"));
+    const auto paintFile = zipFile.getSiblingFile (zipFile.getFileNameWithoutExtension() + "_flow_paint.json");
+    if (paintFile.replaceWithText (juce::JSON::toString (buildPaintJson(), false, 6)))
+        builder.addFile (paintFile, 0, "flow_paint.json");
 
     bool ok = false;
     {
@@ -287,8 +502,9 @@ void RecorderEngine::packZip()
 
     if (ok)
     {
-        masterFile.deleteFile();
+        // το Master.wav μένει και δίπλα στο zip
         for (int b = 0; b < kStems; ++b) { stemFile[b].deleteFile(); midiFile[b].deleteFile(); }
+        paintFile.deleteFile();
     }
     {
         const juce::ScopedLock sl (fileLock);
@@ -300,6 +516,9 @@ void RecorderEngine::packZip()
 void RecorderEngine::finishTake (bool full)
 {
     drainMidi();   // τα τελευταία MIDI πριν κλείσει το take
+    drainInfo (false);
+    takeLength = framesWritten.load();
+    { const juce::ScopedLock sl (infoLock); infoEnd = infoLatest; }
     bool ok = true;
     closeWriters (ok);
     if (ok) packZip();
@@ -319,8 +538,16 @@ void RecorderEngine::startTake()
     if (! w->ok()) { enterError(); return; }
 
     for (auto& v : takeMidi) v.clear();
+    takeInfo.clear();
+    for (auto& pk : takeStemPeak) pk = 0.0f;
     drainMidi();                                  // ό,τι ήρθε πριν το πάτημα δεν ανήκει στο take
     takeStartFrame = framesConsumed;              // η πρώτη στιγμή του WAV
+    drainInfo (true);
+    initBpm = curBpm > 0.0 ? curBpm : 120.0;
+    for (int b = 0; b < kStems; ++b) { initOff[b] = curOff[b]; initStop[b] = curStop[b]; initMute[b] = curMute[b]; }
+    initScene = curScene;
+    { const juce::ScopedLock sl (infoLock); infoStart = infoLatest; }
+    takeStartTime = juce::Time::getCurrentTime();
     takeBpm = juce::jlimit (20.0, 400.0, tempoBpm.load());
     for (int b = 0; b < kStems; ++b) midiFile[b] = dir.getChildFile (base.getFileName() + "_block" + juce::String (b + 1).paddedLeft ('0', 2) + ".mid");
     takeMask = stemMaskNow.load();
@@ -365,6 +592,7 @@ void RecorderEngine::workerStep()
     }
 
     drainMidi();
+    drainInfo (false);
     for (;;)
     {
         const int ready = fifo.getNumReady();
@@ -395,6 +623,9 @@ void RecorderEngine::workerStep()
                 if (todo > 0)
                 {
                     if (! writeRange (chunk, 0, todo)) { enterError(); break; }
+                    for (int b = 0; b < kStems; ++b)
+                        if (stemWriter[b] != nullptr)
+                            takeStemPeak[b] = juce::jmax (takeStemPeak[b], chunk.getMagnitude (2 + 2 * b, 0, todo), chunk.getMagnitude (3 + 2 * b, 0, todo));
                     framesWritten += todo;
                     framesSinceSync += todo;
                 }

@@ -9,6 +9,14 @@
 class SettingsScreen : public juce::Component, private juce::Timer
 {
 public:
+    struct PaintBlock   // Rec Audio info: ομάδα και sequencer ανά block (για το flow_paint.json)
+    {
+        bool active = false;
+        juce::String name;
+        juce::Colour col;
+        int group = -1;    // -1 καμία, 0 percussion, 1 bass/arp, 2 pads/strings, 3 keys, 4 solo, 5 fx
+        int seq = 0;       // 0 auto, 1 Flow, 2 plugin
+    };
     struct SmartBlock
     {
         bool active = false;
@@ -48,6 +56,8 @@ public:
         std::function<juce::File()> recFolder;
         std::function<void (const juce::File&)> setRecFolder;
         std::function<void()> chooseRecFolder;
+        std::function<std::vector<PaintBlock>()> paintBlocks;
+        std::function<void (int, int)> paintGroupSet, paintSeqSet;   // block, τιμή
         std::function<float()> masterGet;
         std::function<void (float)> masterSet;
         std::function<std::vector<PluginRow>()> plugins;   // «My plugins»: όλα τα plugins (τα AU μόνο όταν είναι ανοιχτά)
@@ -140,7 +150,7 @@ public:
         g.setColour (hobby::kScreen);
         g.fillRoundedRectangle (getLocalBounds().toFloat(), 14.0f);
 
-        static const char* titles[] = { "SETTINGS", "SAVE SET", "LOAD SET", "RESTORE LAST SESSION", "REC AUDIO FOLDER", "MASTER OUTPUT", "PANIC", "ORB IMAGES", "LOOP RECORDING", "MIDI LEARN", "WINDOW SIZE", "SMART MASTER", "BLOCK TOOLS", "ORB KNOBS", "SETS", "VOLUME PEDALS", "MY PLUGINS" };
+        static const char* titles[] = { "SETTINGS", "SAVE SET", "LOAD SET", "RESTORE LAST SESSION", "REC AUDIO FOLDER", "MASTER OUTPUT", "PANIC", "ORB IMAGES", "LOOP RECORDING", "MIDI LEARN", "WINDOW SIZE", "SMART MASTER", "BLOCK TOOLS", "ORB KNOBS", "SETS", "VOLUME PEDALS", "MY PLUGINS", "REC AUDIO INFO" };
         g.setColour (dim()); g.setFont (font (13.0f, true));
         g.drawText (titles[(int) page], 40, 26, 500, 20, Justification::centredLeft, false);
         {
@@ -171,6 +181,7 @@ public:
             case Sets:   paintSets (g); break;
             case Pedals: paintPedals (g); break;
             case Plugins: paintPlugins (g); break;
+            case PaintInfo: paintPaintInfo (g); break;
         }
     }
 
@@ -211,7 +222,7 @@ public:
     }
 
 private:
-    enum Page { Home = 0, Save, Load, Restore, RecFolder, Master, Panic, OrbImages, LoopRec, Learn, WindowSize, Smart, Tools, OrbKnobs, Sets, Pedals, Plugins };
+    enum Page { Home = 0, Save, Load, Restore, RecFolder, Master, Panic, OrbImages, LoopRec, Learn, WindowSize, Smart, Tools, OrbKnobs, Sets, Pedals, Plugins, PaintInfo };
     struct Hit { juce::Rectangle<int> r; std::function<void()> fn; };
     Page backPage() const { return (page == Save || page == Load || page == Restore) ? Sets : Home; }
 
@@ -356,6 +367,7 @@ private:
             { 15, "Orb knobs", false, false, {}, true, 13 },
             { 11, "Smart master", false, false, {}, true, 11 },
             { 4, "Rec Audio folder", false, false, [this] { showPage (RecFolder); } },
+            { 4, "Rec Audio info", false, false, [this] { showPage (PaintInfo); } },
             { 8, "Window size", false, false, [this] { showPage (WindowSize); } },
             { 10, "MIDI learn", false, false, [this] { showPage (Learn); } },
             { 0, "Audio & MIDI", false, false, [this] { if (host.openAudio) host.openAudio(); } },
@@ -826,6 +838,61 @@ private:
         }
         pill (g, { 40, 252, 230, 46 }, "Another folder...", false, true, [this] { if (host.chooseRecFolder) host.chooseRecFolder(); });
         note (g, "The quick choices change immediately. Any other folder opens the macOS folder window.", getHeight() - 28);
+    }
+
+    // ---------- Rec Audio info: ομάδα και sequencer ανά block ----------
+    void paintPaintInfo (juce::Graphics& g)
+    {
+        using namespace juce;
+        const auto blocks = host.paintBlocks ? host.paintBlocks() : std::vector<PaintBlock>();
+        static const char* const grp[6] = { "\xe2\x99\xaa", "\xe2\x89\x8b", "\xe2\x98\x81", "\xe2\x96\xa5", "\xe2\x97\x89", "\xe2\x9c\xa6" };   // ♪ ≋ ☁ ▥ ◉ ✦
+        static const char* const grpName[6] = { "percussion", "bass / arp", "pads / strings", "keys", "solo", "fx" };
+        static const char* const seq[3] = { "\xe2\x9f\xb3", "\xe2\x99\xab", "\xe2\x96\xa3" };   // ⟳ ♫ ▣
+        static const char* const seqName[3] = { "auto", "Flow", "plugin" };
+        const int top = 78, rowH = 44, left = 40;
+        const int gx = left + 230, gw = 44, gap = 6;
+        const int sx = gx + 6 * (gw + gap) + 24;
+        g.setColour (dim()); g.setFont (font (11.0f, true));
+        g.drawText ("GROUP", gx, top - 20, 6 * (gw + gap), 16, Justification::centredLeft, false);
+        g.drawText ("SEQUENCER", sx, top - 20, 3 * (gw + gap), 16, Justification::centredLeft, false);
+        int hoverG = -1, hoverS = -1;
+        for (int b = 0; b < (int) blocks.size(); ++b)
+        {
+            const auto& B = blocks[(size_t) b];
+            const int y = top + b * rowH;
+            g.setColour (B.active ? B.col : Colour (0xff3a3632)); g.fillEllipse ((float) left, (float) y + 6.0f, 30.0f, 30.0f);
+            g.setColour (B.active ? Colour (0xff23201d) : dim()); g.setFont (font (13.0f, true));
+            g.drawText (String (b + 1), left, y + 6, 30, 30, Justification::centred, false);
+            g.setColour (B.active ? txt() : dim().withAlpha (0.5f)); g.setFont (font (13.0f));
+            g.drawText (B.active ? B.name : String ("empty"), left + 40, y + 6, 180, 30, Justification::centredLeft, true);
+            if (! B.active) continue;
+            for (int k = 0; k < 6; ++k)
+            {
+                const Rectangle<int> r (gx + k * (gw + gap), y + 3, gw, 36);
+                const bool sel = B.group == k;
+                if (hov (r)) hoverG = k;
+                g.setColour (sel ? Colour (0xff4a4642) : hov (r) ? Colour (0xff423d39) : Colour (0xff36322f)); g.fillRoundedRectangle (r.toFloat(), 18.0f);
+                g.setColour (sel ? Colour (0xfff3f4f6) : lineC()); g.drawRoundedRectangle (r.toFloat().reduced (0.5f), 18.0f, sel ? 1.8f : 1.0f);
+                g.setColour (sel ? txt() : dim()); g.setFont (font (18.0f, true));
+                g.drawText (String::fromUTF8 (grp[k]), r, Justification::centred, false);
+                hits.push_back ({ r, [this, b, k, sel] { if (host.paintGroupSet) host.paintGroupSet (b, sel ? -1 : k); repaint(); } });   // ξανά πάτημα = καμία ομάδα
+            }
+            for (int k = 0; k < 3; ++k)
+            {
+                const Rectangle<int> r (sx + k * (gw + gap), y + 3, gw, 36);
+                const bool sel = B.seq == k;
+                if (hov (r)) hoverS = k;
+                g.setColour (sel ? Colour (0xff4a4642) : hov (r) ? Colour (0xff423d39) : Colour (0xff36322f)); g.fillRoundedRectangle (r.toFloat(), 18.0f);
+                g.setColour (sel ? Colour (0xfff3f4f6) : lineC()); g.drawRoundedRectangle (r.toFloat().reduced (0.5f), 18.0f, sel ? 1.8f : 1.0f);
+                g.setColour (sel ? txt() : dim()); g.setFont (font (18.0f, true));
+                g.drawText (String::fromUTF8 (seq[k]), r, Justification::centred, false);
+                hits.push_back ({ r, [this, b, k] { if (host.paintSeqSet) host.paintSeqSet (b, k); repaint(); } });
+            }
+        }
+        String legend = "Group: none selected = null in the file.   Sequencer: \xe2\x9f\xb3 auto (notes = Flow, only audio = plugin), \xe2\x99\xab Flow, \xe2\x96\xa3 plugin.";
+        if (hoverG >= 0) legend = String ("Group: ") + grpName[hoverG];
+        else if (hoverS >= 0) legend = String ("Sequencer: ") + seqName[hoverS];
+        note (g, String::fromUTF8 (legend.toRawUTF8()), getHeight() - 28);
     }
 
     // ---------- master output ----------

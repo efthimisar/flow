@@ -153,6 +153,7 @@ namespace flow
                 lo[b] = firstPlayNote; hi[b] = firstPlayNote;
                 holdMode[b] = 0; latchBits[(size_t) b * 2] = 0; latchBits[(size_t) b * 2 + 1] = 0; swBits[(size_t) b * 2] = 0; swBits[(size_t) b * 2 + 1] = 0; autoReadyOut[(size_t) b] = 0; autoPausedOut[(size_t) b] = 0;
                 liveSilent[b] = 1;
+                paintGroup[(size_t) b] = -1; paintSeq[(size_t) b] = 0;
                 blockOff[b] = 0; chordMode[b] = 0; chordType[b] = 0; chordMinor[b] = 0; chordTonic[b] = -1; pcMaskOut[b] = 0; bassOut[b] = -1;
                 arpMode[b] = 0;
                 curveMode[b] = 0;
@@ -717,6 +718,18 @@ namespace flow
             return out;
         }
 
+        // μόνο τα μήκη της λούπας (για το flow_paint.json, χωρίς αντιγραφή νοτών)
+        bool getLoopLengths (int b, double& beats, std::vector<double>& layerBeats)
+        {
+            const juce::ScopedLock sl (lock);
+            auto& B = blocks[(size_t) b];
+            if (B.nLayers == 0 || B.loopBeats <= 0.0) return false;
+            beats = B.loopBeats;
+            layerBeats.clear();
+            for (int l = 0; l < B.nLayers; ++l) layerBeats.push_back (B.layerBeats[(size_t) l]);
+            return true;
+        }
+
         // loops: αποθήκευση / φόρτωση νοτών
         bool getLoop (int b, LoopSnapshot& snap)
         {
@@ -766,6 +779,8 @@ namespace flow
         juce::uint32 stripLastMs = 0;
         std::atomic<SceneData*> scenePend { nullptr };
         std::atomic<int> sceneDone { 0 };
+        std::atomic<int> sceneIndexReq { 0 }, sceneIndexNow { 0 };   // Rec Audio: ποια σκηνή ζητήθηκε / ισχύει (το UI γράφει το πρώτο)
+        std::array<std::atomic<int>, numBlocks> paintGroup, paintSeq;   // flow_paint.json: ομάδα (-1 καμία) και sequencer (0 auto, 1 Flow, 2 plugin) ανά block
 
         bool sceneRequestSwap (SceneData* d)
         {
@@ -874,6 +889,7 @@ namespace flow
             sceneSwapLocked (*p);
             stopAllAt = -1.0;   // ένα Stop όλων σε αναμονή ακυρώνεται με την αλλαγή σκηνής
             scenePend = nullptr;
+            sceneIndexNow = sceneIndexReq.load();
             ++sceneDone;
         }
 
@@ -1182,6 +1198,16 @@ namespace flow
                 metroPos = -1;
             }
 
+            {   // Rec Audio: αλλαγές κατάστασης (tempo, on/off, mute, stop, σκηνή) με θέση στο χρόνο
+                int offA[RecorderEngine::kStems] = {}, stopA[RecorderEngine::kStems] = {}, muteA[RecorderEngine::kStems] = {};
+                for (int b = 0; b < numBlocks; ++b)
+                {
+                    offA[b] = blockOff[(size_t) b].load() != 0 ? 1 : 0;
+                    stopA[b] = blocks[(size_t) b].stopped ? 1 : 0;
+                    muteA[b] = (int) (blocks[(size_t) b].muteMask & 3u);
+                }
+                recorder.trackState (blkBps * sr * 60.0, offA, stopA, muteA, sceneIndexNow.load());
+            }
             {
                 juce::AudioBuffer<float> mview (masterBuf.getArrayOfWritePointers(), 2, numSamples);
                 juce::AudioBuffer<float> sview (stemBuf.getArrayOfWritePointers(), 2 * RecorderEngine::kStems, numSamples);

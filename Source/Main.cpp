@@ -478,6 +478,7 @@ private:
         if (! scenes[(size_t) i].saved) sceneSettingsFromLive (scenes[(size_t) i]);
         sceneBuf = scenes[(size_t) i];
         sceneBuf.prepare();
+        engine.sceneIndexReq = i;
         if (! engine.sceneRequestSwap (&sceneBuf)) return;
         sceneTarget = i;
         sceneReqMs = Time::getMillisecondCounter();
@@ -4076,6 +4077,21 @@ private:
             return String (backupBlocks) + (backupBlocks == 1 ? " block" : " blocks") + "  " + String (backupTempo) + " BPM";
         };
         h.restoreSession = [this] { restoreLastSession(); };
+        h.paintBlocks = [this]
+        {
+            std::vector<SettingsScreen::PaintBlock> v ((size_t) flow::numBlocks);
+            for (int b = 0; b < flow::numBlocks; ++b)
+            {
+                auto& x = v[(size_t) b];
+                if (auto* p = engine.getPlugin (b)) { x.active = true; x.name = p->getName(); }
+                x.col = blockLight (b);
+                x.group = engine.paintGroup[(size_t) b].load();
+                x.seq = engine.paintSeq[(size_t) b].load();
+            }
+            return v;
+        };
+        h.paintGroupSet = [this] (int b, int g) { if (b >= 0 && b < flow::numBlocks) { engine.paintGroup[(size_t) b] = jlimit (-1, 5, g); saveNow(); } };
+        h.paintSeqSet   = [this] (int b, int s) { if (b >= 0 && b < flow::numBlocks) { engine.paintSeq[(size_t) b] = jlimit (0, 2, s); saveNow(); } };
         h.recFolder = [this] { return engine.recorder.getFolder(); };
         h.setRecFolder = [this] (const File& f) { f.createDirectory(); engine.recorder.setFolder (f); saveNow(); };
         h.chooseRecFolder = [this] { chooseTapeFolder(); };
@@ -4396,6 +4412,7 @@ private:
                 }
             }
             e->setAttribute ("slot", b);
+            e->setAttribute ("pgroup", engine.paintGroup[(size_t) b].load()); e->setAttribute ("pseq", engine.paintSeq[(size_t) b].load());
             e->setAttribute ("lo", engine.lo[(size_t) b].load());
             e->setAttribute ("hi", engine.hi[(size_t) b].load());
             e->setAttribute ("seq", engine.zoneSeq[(size_t) b].load());
@@ -4620,6 +4637,7 @@ private:
         if (auto* sx = root.getChildByName ("Scenes"))
         {
             currentScene = jlimit (0, kScenes - 1, sx->getIntAttribute ("current", 0));
+            engine.sceneIndexReq = currentScene; engine.sceneIndexNow = currentScene;
             for (auto* si : sx->getChildWithTagNameIterator ("Scene"))
             {
                 const int idx = si->getIntAttribute ("idx", -1);
@@ -4671,11 +4689,14 @@ private:
 
         engine.specialBlock = -1; engine.specialBlock2 = -1;
         engine.mfBlock = -1;
+        for (int pb = 0; pb < flow::numBlocks; ++pb) { engine.paintGroup[(size_t) pb] = -1; engine.paintSeq[(size_t) pb] = 0; }
         for (auto* e : root.getChildWithTagNameIterator ("Block"))
         {
             const int origSlot = e->getIntAttribute ("slot", -1);
             const int slot = mapSlot (origSlot);
             if (slot < 0) continue;
+            engine.paintGroup[(size_t) slot] = jlimit (-1, 5, e->getIntAttribute ("pgroup", -1));
+            engine.paintSeq[(size_t) slot] = jlimit (0, 2, e->getIntAttribute ("pseq", 0));
 
             auto inst = readPluginEntry (e->getChildByName ("Instrument"));
             if (! inst.ok) continue;
@@ -5242,8 +5263,59 @@ private:
     }
 
     int lastFollowed = -1;
+    // Rec Audio: στιγμιότυπο πληροφοριών για το flow_paint.json (περίπου κάθε δευτερόλεπτο)
+    int paintInfoTick = 0;
+    void pushPaintInfo()
+    {
+        using juce::var; using juce::DynamicObject;
+        auto mk = [] { return var (new DynamicObject()); };
+        auto root = mk();
+        root.getDynamicObject()->setProperty ("flow_version", JUCEApplication::getInstance() != nullptr ? JUCEApplication::getInstance()->getApplicationVersion() : String());
+        root.getDynamicObject()->setProperty ("limiter", engine.limiterOn.load() != 0);
+        juce::Array<var> blocks;
+        for (int b = 0; b < RecorderEngine::kStems; ++b)
+        {
+            auto o = mk();
+            auto* p = b < flow::numBlocks ? engine.getPlugin (b) : nullptr;
+            o.getDynamicObject()->setProperty ("plugin", p != nullptr);
+            if (p != nullptr)
+            {
+                o.getDynamicObject()->setProperty ("name", p->getName());
+                o.getDynamicObject()->setProperty ("group", engine.paintGroup[(size_t) b].load());
+                o.getDynamicObject()->setProperty ("seq", engine.paintSeq[(size_t) b].load());
+                const float g = engine.gainOut[(size_t) b].load();
+                o.getDynamicObject()->setProperty ("volume_db", g > 0.00001f ? var ((double) (20.0f * std::log10 (g))) : var());
+                double beats = 0.0; std::vector<double> lb;
+                if (engine.getLoopLengths (b, beats, lb))
+                {
+                    auto lo = mk();
+                    lo.getDynamicObject()->setProperty ("beats", beats);
+                    lo.getDynamicObject()->setProperty ("anchor_beat", var());
+                    juce::Array<var> la; for (auto x : lb) la.add (x);
+                    lo.getDynamicObject()->setProperty ("layer_beats", la);
+                    o.getDynamicObject()->setProperty ("loop", lo);
+                }
+                juce::Array<var> chain;
+                for (int k = 0; k < engine.numFx (b); ++k)
+                    if (auto* f = engine.getFx (b, k))
+                    {
+                        auto fo = mk();
+                        fo.getDynamicObject()->setProperty ("name", f->getName());
+                        if (auto* bp = f->getBypassParameter()) fo.getDynamicObject()->setProperty ("bypassed", bp->getValue() >= 0.5f);
+                        else fo.getDynamicObject()->setProperty ("bypassed", var());
+                        chain.add (fo);
+                    }
+                o.getDynamicObject()->setProperty ("fx_chain", chain);
+            }
+            blocks.add (o);
+        }
+        root.getDynamicObject()->setProperty ("blocks", blocks);
+        engine.recorder.setInfo (root);
+    }
+
     void timerCallback() override
     {
+        if (++paintInfoTick >= 30) { paintInfoTick = 0; pushPaintInfo(); }
         {   // μπλε κουμπί: τι αποφάσισε το thread ήχου (για έλεγχο στο Flow-log)
             const int g = engine.tapeDbgGen.load();
             if (g != lastTapeDbg)
@@ -5467,7 +5539,7 @@ class FlowApplication : public JUCEApplication
 {
 public:
     const String getApplicationName() override    { return "Flow"; }
-    const String getApplicationVersion() override { return "0.90.31"; }
+    const String getApplicationVersion() override { return "0.90.32"; }
     bool moreThanOneInstanceAllowed() override    { return false; }
 
     void initialise (const String&) override

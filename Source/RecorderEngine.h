@@ -36,6 +36,10 @@ public:
     // audio thread: τα MIDI που παίρνει κάθε block (νότες, CC, pitch bend) κατά τη λήψη· πάνε στο zip ως Block NN.mid
     void setTempo (double bpm) noexcept { tempoBpm.store (bpm, std::memory_order_relaxed); }
     void recordMidi (int block, const juce::MidiBuffer& events);
+    // audio thread: κατάσταση ανά block στην αρχή κάθε block ήχου· οι αλλαγές γράφονται ως γεγονότα (flow_paint.json)
+    void trackState (double bpm, const int* off, const int* stopped, const int* muteMask, int scene);
+    // message thread: στιγμιότυπο πληροφοριών (όνομα plugin, ομάδα, loop, fx κ.λπ.) για το flow_paint.json
+    void setInfo (const juce::var& v) { const juce::ScopedLock sl (infoLock); infoLatest = v; }
     State  getState() const noexcept        { return (State) state.load(); }
     bool   isTapeFull() const noexcept      { return tapeFull.load(); }
     double getElapsedSeconds() const noexcept { return (double) framesWritten.load() / juce::jmax (1.0, sampleRate.load()); }
@@ -62,6 +66,8 @@ private:
     void closeWriters (bool& ok);
     void packZip();
     void drainMidi();
+    void drainInfo (bool atStart);
+    juce::var buildPaintJson();
     bool writeMidiFile (int block, const juce::File& f);
 
     // FIFO audio → worker
@@ -81,6 +87,21 @@ private:
     double takeBpm = 120.0;
     std::vector<MidiEv> takeMidi[kStems];
     juce::File midiFile[kStems];
+
+    // γεγονότα κατάστασης audio thread → worker (ίδια χρονική βάση)
+    struct InfoEv { int64_t frame = 0; uint8_t type = 0, block = 0; int32_t iv = 0; float fv = 0.0f; };   // type: 0 tempo, 1 off, 2 mute, 3 stop, 4 σκηνή
+    juce::AbstractFifo infoFifo { 1 };
+    std::vector<InfoEv> infoRing;
+    double lastBpm = -1.0;                                         // μόνο audio thread
+    int lastOff[kStems], lastStop[kStems], lastMute[kStems], lastScene = -1;
+    double curBpm = 120.0; int curOff[kStems] = {}, curStop[kStems] = {}, curMute[kStems] = {}, curScene = 0;   // μόνο worker: κατάσταση μέχρι τώρα
+    double initBpm = 120.0; int initOff[kStems] = {}, initStop[kStems] = {}, initMute[kStems] = {}, initScene = 0;   // κατάσταση στο πρώτο sample του take
+    std::vector<InfoEv> takeInfo;
+    float takeStemPeak[kStems] = {};
+    juce::CriticalSection infoLock;
+    juce::var infoLatest, infoStart, infoEnd;
+    juce::Time takeStartTime;
+    int64_t takeLength = 0;
 
     // pre-roll (μόνο worker)
     juce::AudioBuffer<float> preRoll;
