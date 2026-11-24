@@ -421,6 +421,8 @@ namespace flow
         int seenTape = 0, tapeTaps = 0; juce::uint32 tapeLastMs = 0;
         std::atomic<int> playAllGen { 0 };
         std::atomic<int> loopsStopped { 0 };
+        std::atomic<int> tapeDbgGen { 0 }, tapeDbgTaps { 0 }, tapeDbgBranch { 0 }, tapeDbgLoops { 0 };   // για το Flow-log: τι αποφάσισε το μπλε κουμπί
+        std::atomic<double> tapeDbgBeat { 0.0 }, tapeDbgCyc { 0.0 }, tapeDbgAnc { 0.0 };
         std::atomic<double> stopAllAt { -1.0 };   // beat όπου θα σταματήσουν όλες οι λούπες (-1 = κανένα Stop σε αναμονή)
         void pressOverdub (int b) { if (b >= 0) rerecReq[(size_t) b] = 1; }   // overdub (μέχρι 2 στρώματα) ή κλείσιμό του
         void pressReRec (int b) { if (b >= 0) rerecReq[(size_t) b] = 1; }   // ξαναγράφω: σβήνει τη λούπα του block και ξεκινά νέα εγγραφή
@@ -839,13 +841,17 @@ namespace flow
                     if (B.plugin != nullptr && B.loopBeats > 0.0 && (B.loopState == loopPlay || B.loopState == loopOver))
                     { anyLoop = true; if (B.userStopped) anyUserStopped = true; }
                 stopAllAt = -1.0;
-                if (stopped || (taps == 1 && anyUserStopped && ! pend)) { loopsStopped = 0; ++playAllGen; }   // Play όλων
-                else if (taps == 1 || ! anyLoop) loopsStopped = 1;                                              // Stop αμέσως
+                int branch = 0;
+                if (stopped || (taps == 1 && anyUserStopped && ! pend)) { branch = 1; loopsStopped = 0; ++playAllGen; }   // Play όλων
+                else if (taps == 1 || ! anyLoop) { branch = taps == 1 ? 2 : 5; loopsStopped = 1; }                // Stop αμέσως
                 else if (! pend)                                                                                 // Stop στο τέλος της μεγαλύτερης λούπας
                 {
                     const double cyc = playCycle(), anc = playCycleAnchor();
                     stopAllAt = anc + std::ceil ((beat0 - anc) / cyc - 1.0e-9) * cyc;
+                    branch = 3; tapeDbgCyc = cyc; tapeDbgAnc = anc;
                 }
+                else branch = 4;   // ακύρωση
+                tapeDbgTaps = taps; tapeDbgBranch = branch; tapeDbgLoops = anyLoop ? 1 : 0; tapeDbgBeat = beat0; ++tapeDbgGen;
                 ++changeCount;
             }
             const double at = stopAllAt.load();

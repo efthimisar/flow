@@ -5244,6 +5244,21 @@ private:
     int lastFollowed = -1;
     void timerCallback() override
     {
+        {   // μπλε κουμπί: τι αποφάσισε το thread ήχου (για έλεγχο στο Flow-log)
+            const int g = engine.tapeDbgGen.load();
+            if (g != lastTapeDbg)
+            {
+                lastTapeDbg = g;
+                static const char* const names[] = { "-", "play all", "stop now (1 press)", "stop at end of longest loop", "cancel pending stop", "stop now (no loop)" };
+                const int br = engine.tapeDbgBranch.load();
+                flow::flowLog ("tape button: taps=" + String (engine.tapeDbgTaps.load()) + " -> " + names[jlimit (0, 5, br)] + " | loops=" + String (engine.tapeDbgLoops.load())
+                               + " beat=" + String (engine.tapeDbgBeat.load(), 2) + " cycle=" + String (engine.tapeDbgCyc.load(), 2) + " anchor=" + String (engine.tapeDbgAnc.load(), 2)
+                               + " stopAt=" + String (engine.stopAllAt.load(), 2));
+            }
+            const bool pn = engine.stopAllAt.load() < 0.0 && lastTapePend;
+            lastTapePend = engine.stopAllAt.load() >= 0.0;
+            if (pn && engine.loopsStopped.load() != 0) flow::flowLog ("tape button: stopped at the end of the longest loop");
+        }
         // focus: το block που έπαιξες τελευταίο γίνεται αυτόματα το επιλεγμένο (οθόνη, κουμπιά λούπας, πετάλια)
         {
             const int req = engine.asSelectReq.exchange (-1);
@@ -5441,6 +5456,7 @@ private:
     AudioMidiPanel audioPanel { deviceManager, typeface };
     SettingsScreen settingsScreen { typeface };
     bool audioFromSettings = false;
+    int lastTapeDbg = 0; bool lastTapePend = false;
     ValueTile blockTile, vstTile, mfxTile, fxTile, holdTile, chordTile, recTile, undoTile, stopTile, tapeTile, metroTile, folderTile, smartTile, motionTile;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
@@ -5451,7 +5467,7 @@ class FlowApplication : public JUCEApplication
 {
 public:
     const String getApplicationName() override    { return "Flow"; }
-    const String getApplicationVersion() override { return "0.90.30"; }
+    const String getApplicationVersion() override { return "0.90.31"; }
     bool moreThanOneInstanceAllowed() override    { return false; }
 
     void initialise (const String&) override
